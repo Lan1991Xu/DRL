@@ -1,0 +1,292 @@
+function new_metric = update_metric(update_options)
+incr_method = update_options.incremental_method;
+
+switch incr_method
+    case {'LEGO','our'}        
+        new_metric = hw_LEGO_update(update_options);
+    case {'POP','Chunxiao'}
+        new_metric = hw_POP_update(update_options);
+    case 'PRF'
+        new_metric = hw_PRF_update(update_options);
+    case 'NPRF'
+        new_metric = hw_NPRF_update(update_options);
+    case 'EMR'
+        new_metric = hw_EMR_update(update_options);
+    case 'Rocchio'      
+        new_metric = hw_Rocchio_update(update_options);
+    otherwise
+        error('Unknown incremental-updating scheme.')
+end
+
+%% LEGO update
+function new_metric = hw_LEGO_update(opt)
+% *** add graph in params for propagation?
+A = opt.curr_metric;
+curr_idx =  opt.current_idx;        sim_idx = opt.new_cons.weak_id;
+disim_idx = opt.new_cons.strong_id;  match_idx = opt.new_cons.match_id;
+all_feats = opt.all_features;        all_camid = opt.all_camid;
+
+curr_camid = all_camid(curr_idx);  %
+othercam_mask = find(all_camid ~= curr_camid);
+
+Xi  = all_feats(curr_idx,:);
+Xj  = all_feats(othercam_mask,:);
+
+Xj_dif = all_feats(disim_idx,:);
+Xj_sim = all_feats(sim_idx,:);
+Xj_match = all_feats(match_idx,:);
+
+d = size(Xj,2);
+
+dif = bsxfun(@minus,Xi,Xj);
+foo = dif * A;
+D = sum(foo.*dif,2);
+
+if ~isempty(Xj_dif)
+yt = prctile(D,50);
+yt_hat  = D((othercam_mask == disim_idx));
+zt = (Xi - Xj_dif)';
+lambda = 2e-1;
+end
+
+if ~isempty(Xj_sim)
+yt = prctile(D,0.1);
+yt_hat  = D((othercam_mask == sim_idx));
+zt = (Xi - Xj_sim)';
+lambda = 0e-1;
+end
+
+if ~isempty(Xj_match)
+yt = 0.9*min(D);%0;
+yt_hat  = D((othercam_mask == match_idx));
+zt = (Xi - Xj_match)';
+lambda = 0;
+end
+
+update = updateA(A,yt,yt_hat,zt);
+new_metric = A - update - lambda*A; %regu-1: frobenius regularizer
+
+if norm(new_metric,'fro')<200
+    new_metric = new_metric.*50;
+end    
+
+function update = updateA(A,yt,yt_hat,zt)
+eta = 5e-1;
+y_bar = (eta*yt*yt_hat - 1 + sqrt((eta*yt*yt_hat-1)^2 + 4*eta*yt_hat^2))/(2*eta*yt_hat);
+Azt = A*zt;
+nom =  eta*(y_bar-yt)*(Azt*Azt'); % final choice.
+%nom = eta*(y_bar-yt)*(A*zt)*(zt'*A); % much faster 0.0x second
+%nom2 = eta*(y_bar-yt)*A*(zt*zt')*A;  % slow 4 seconds
+denom = 1+eta*(y_bar - yt)*zt'*Azt;
+update = nom/denom;
+
+%% POP update
+function new_metric = hw_POP_update(opt)
+curr_idx  =  opt.current_idx;       
+all_feats = opt.all_features;        
+all_camid = opt.all_camid;
+all_cons  = opt.all_cons;
+affM      = opt.affM;
+
+cons_id = find([all_cons(:).idx]==curr_idx);
+assert(length(cons_id)==1,'Error happens. Duplicate constraint idx exists.');
+
+disim_idx = all_cons(cons_id).cons.strong_id;
+sim_idx   = all_cons(cons_id).cons.weak_id;
+match_idx = all_cons(cons_id).cons.match_id;
+
+curr_camid    = all_camid(curr_idx);
+other_camid   = setdiff(all_camid,curr_camid);
+othercam_mask = find(all_camid ~= curr_camid);
+
+Xi  = all_feats(curr_idx,:);
+Xj  = all_feats(othercam_mask,:);
+dif = bsxfun(@minus,Xi,Xj);
+
+options=make_options('gamma_I',0.1,'gamma_A',0.1,'NN',40,'KernelParam',2.75, ...
+    'Hinge', 1, 'UseBias', 0);
+
+options.Verbose=0;
+
+[~,disim] = intersect(othercam_mask,disim_idx);
+[~,sim] = intersect(othercam_mask,sim_idx);
+[~,match] = intersect(othercam_mask,match_idx);
+
+label = zeros(size(othercam_mask));  label(disim) = -1; 
+label(sim)   = 1;  label(match) = 1;
+
+data.X = dif;
+data.Y = label(:);
+
+ % kernel
+data.K = calckernel(options, dif,dif); 
+
+affM = affM{other_camid};
+
+% in case affM isnot sparse, then convert int to a sparse affinity matrix
+if 1
+    % sparse
+    nsample = size(affM, 2);
+    keepNum = options.NN;
+    if keepNum <= 1
+      keepNum = floor(keepNum * nsample);legend('Our','POP','Rocchio','EMR','NPRF','PRF','Location','northeast');
+    end
+    [~, deOrder] = sort(affM, 2, 'descend');
+    for i = 1:nsample
+      affM(i, deOrder(i,keepNum+1:end)) = 0;
+    end
+    
+end
+
+% keep symmetric
+affM = (affM + affM') / 2;
+
+% manifold constraint using laplacian matrix
+
+[data.L, options] = mylaplacian(options, affM);    % manifold by random forest 
+
+new_metric = lapsvmp(options, data);
+new_metric.curr_idx = curr_idx;
+new_metric = rmfield(new_metric,'xtrain');
+
+function new_metric = hw_PRF_update(opt)
+curr_idx  =  opt.current_idx;       
+all_feats = opt.all_features;        
+all_camid = opt.all_camid;
+
+sim_idx = opt.new_cons.weak_id;
+match_idx = opt.new_cons.match_id;
+
+curr_camid    = all_camid(curr_idx);
+othercam_mask = find(all_camid ~= curr_camid);
+
+[~,sim] = intersect(othercam_mask,sim_idx);
+[~,match] = intersect(othercam_mask,match_idx);
+
+Xi  = all_feats(curr_idx,:);
+Xj  = all_feats(othercam_mask,:);
+dif = bsxfun(@minus,Xi,Xj([sim(:);match(:)],:));
+
+X = dif;
+Y = ones(1,length([sim(:);match(:)]));
+
+w = ones(1,length(Y));
+if ~isempty(match)
+    w(end-length(match)+1:end) = 50;
+end    
+w = w ./sum(w);
+
+svmoption = '-s 2 -t 0 -d 3 -g 0.1 -n 0.7 -m 1000 -q 1 -v 5';
+new_metric = svmtrain(w(:), Y(:), X, svmoption);
+
+function new_metric = hw_NPRF_update(opt)
+curr_idx  =  opt.current_idx;       
+all_feats = opt.all_features;        
+all_camid = opt.all_camid;
+
+disim_idx = opt.new_cons.strong_id;
+sim_idx = opt.new_cons.weak_id;
+match_idx = opt.new_cons.match_id;
+
+curr_camid    = all_camid(curr_idx);
+othercam_mask = find(all_camid ~= curr_camid);
+
+[~,sim] = intersect(othercam_mask,sim_idx);
+[~,disim] = intersect(othercam_mask,disim_idx);
+[~,match] = intersect(othercam_mask,match_idx);
+
+Xi  = all_feats(curr_idx,:);
+Xj  = all_feats(othercam_mask,:);
+dif = bsxfun(@minus,Xi,Xj([sim(:);match(:);disim(:)],:));
+
+X = dif;
+Y = ones(1,length([sim(:);match(:);disim(:)]));
+disim_mask = [zeros(1,length(sim)),zeros(1,length(match)),ones(1,length(disim))];
+Y(logical(disim_mask)) = -1;
+
+w = ones(1,length(Y));
+match_mask = [zeros(1,length(sim)),ones(1,length(match)),zeros(1,length(disim))];
+if ~isempty(match)
+    w(logical(match_mask)) = 200;
+end    
+w = w ./sum(w);
+
+svmoption = '-s 0 -t 0 -d 3 -g 0.1 -c 1 -m 1000 -q 1 -v 5';
+
+new_metric = svmtrain(w(:), Y(:), X, svmoption);
+
+function new_metric = hw_EMR_update(opt)
+curr_idx  =  opt.current_idx;       
+all_feats = opt.all_features;        
+all_camid = opt.all_camid;
+all_cons  = opt.all_cons;
+
+cons_id = find([all_cons(:).idx]==curr_idx);
+assert(length(cons_id)==1,'Error happens. Duplicate constraint idx exists.');
+
+disim_idx = all_cons(cons_id).cons.strong_id;
+sim_idx   = all_cons(cons_id).cons.weak_id;
+match_idx = all_cons(cons_id).cons.match_id;
+
+curr_camid    = all_camid(curr_idx);
+
+othercam_mask = find(all_camid ~= curr_camid);
+
+Xi  = all_feats(curr_idx,:);
+Xj  = all_feats(othercam_mask,:);
+dif = bsxfun(@minus,Xi,Xj);
+
+[~,disim] = intersect(othercam_mask,disim_idx);
+[~,sim] = intersect(othercam_mask,sim_idx);
+[~,match] = intersect(othercam_mask,match_idx);
+
+label = zeros(size(othercam_mask));  label(disim) = -1; 
+label(sim)   = 1;  label(match) = 1;
+if ~isempty(match)
+    label(sim) = 0;
+end
+
+%
+label(label <= 0) = 0;
+label(label > 0)  = 1;
+
+%
+Eopts = [];
+Eopts.p = 50;
+[new_metric, ~] = EMR(dif,label(:),Eopts); % distance
+
+function new_metric = hw_Rocchio_update(opt)
+curr_idx  =  opt.current_idx;       
+all_feats = opt.all_features;        
+all_camid = opt.all_camid;
+all_cons  = opt.all_cons;
+
+cons_id = find([all_cons(:).idx]==curr_idx);
+assert(length(cons_id)==1,'Error happens. Duplicate constraint idx exists.');
+
+disim_idx = all_cons(cons_id).cons.strong_id;
+sim_idx   = all_cons(cons_id).cons.weak_id;
+match_idx = all_cons(cons_id).cons.match_id;
+
+Xd = all_feats(disim_idx,:);
+Xs = all_feats([sim_idx(:);match_idx(:)],:);
+
+curr_camid    = all_camid(curr_idx);
+
+othercam_mask = (all_camid ~= curr_camid);
+
+Xi  = all_feats(curr_idx,:);
+Xj  = all_feats(othercam_mask,:);
+
+if isempty(Xd)
+    Xd = zeros(size(Xi));
+end
+if isempty(Xs)
+    Xs = zeros(size(Xi));
+end    
+
+beta = 0.5; gamma = 0.5;
+new_Xi = Xi + beta/(size(Xs,1))* sum(Xs,1) - gamma/(size(Xd,1))* sum(Xd,1);
+
+new_dif = bsxfun(@minus,new_Xi,Xj);
+new_metric = (-sum(new_dif.^2,2));
